@@ -1,15 +1,17 @@
 import torch
-from typing import Final, Optional
+from typing import Final, Any
 
 class Rank1UpdatableTopkSVD:
 
     __slots__ = [
         'device','dtype','X','n','m','k','oversample','r','tol', 'update_count',
-        'U','S','Vh','subspace_iters','use_expanded_subspace','recompute_every'
+        'U','S','Vh','subspace_iters','use_expanded_subspace','recompute_every',
+        'use_rand_trunk_svd', 'rand_trunk_svd_iters'
     ]
 
     def __init__(self, X: torch.Tensor, k: int, oversample: int = 0, tol: float = 1e-9,
-                 subspace_iters: int = 1, use_expanded_subspace: bool = True, recompute_every: int = 0) -> None:
+                 subspace_iters: int = 1, use_expanded_subspace: bool = True, recompute_every: int = 0,
+                 use_rand_trunk_svd: bool = False, rand_trunk_svd_iters: int = 7) -> None:
         '''
         Initialize the UpdatableSVD.
 
@@ -22,6 +24,9 @@ class Rank1UpdatableTopkSVD:
             use_expanded_subspace:  Whether to expand the subspace for the subspace iteration by the orthogonal
                 components of the rank-1 update. (Only applies if k + oversample <= min(n, m) - 2)
             recompute_every:  Recompute the SVD of the matrix after the rank-1 update every recompute_every updates.
+            use_rand_trunk_svd:  Initialize and recompute the SVD of the matrix using a randomized truncated SVD
+                instead of torch.linalg.svd. Worse accuracy than torch.linalg.svd -> only useful for very large matrices.
+            rand_trunk_svd_iters:  The number of power iterations to perform on the randomized truncated SVD.
         '''
         self.device, self.dtype = X.device, X.dtype
         self.X = X
@@ -34,6 +39,9 @@ class Rank1UpdatableTopkSVD:
         self.use_expanded_subspace: Final[bool] = use_expanded_subspace and self.r <= min(self.n, self.m) - 2
         self.recompute_every: Final[int] = recompute_every
         self.update_count = 0
+        self.use_rand_trunk_svd: Final[bool] = use_rand_trunk_svd
+        self.rand_trunk_svd_iters: Final[int] = rand_trunk_svd_iters
+        assert self.rand_trunk_svd_iters > 0, "rand_trunk_svd_iters must be positive"
         self._init_topr()
 
     def __repr__(self) -> str:
@@ -61,10 +69,13 @@ class Rank1UpdatableTopkSVD:
         '''
         Initialize the top-r factors of the SVD of the matrix.
         '''
-        U, S, Vh = torch.linalg.svd(self.X, full_matrices=False)
-        self.U = U[:, :self.r].contiguous()
-        self.S = S[:self.r].contiguous()
-        self.Vh = Vh[:self.r, :].contiguous()
+        if self.use_rand_trunk_svd:
+            self._rand_trunk_svd()
+        else:
+            U, S, Vh = torch.linalg.svd(self.X, full_matrices=False)
+            self.U = U[:, :self.r].contiguous()
+            self.S = S[:self.r].contiguous()
+            self.Vh = Vh[:self.r, :].contiguous()
 
     def to(self, device=None, dtype=None) -> 'Rank1UpdatableTopkSVD':
         '''
@@ -161,9 +172,58 @@ class Rank1UpdatableTopkSVD:
         assert t.device == self.device and t.dtype == self.dtype
 
     @torch.no_grad()
+    def _rand_trunk_svd(self) -> None:
+        '''
+        Approximation of the truncated SVD of X, based on the prototype for
+        randomized SVD in https://arxiv.org/pdf/0909.4061
+        (Finding structure in randomness: Probabilistic algorithms for constructing
+        approximate matrix decompositions, N. Halko, P. G. Martinsson, J. A. Tropp)
+        '''
+        if self.m < self.n:
+            # randomized range finder
+            Y = self.X @ torch.randn(self.m, self.r, dtype=self.dtype, device=self.device)
+            Y, _ = torch.linalg.qr(Y, mode='reduced')
+            # sharpen spectrum with power iterations
+            for i in range(self.rand_trunk_svd_iters):
+                end_with_qr = False
+                Y = self.X @ (self.X.T @ Y)
+                if i % 4 == 0: # reorthogonalize during long power iteration
+                    end_with_qr = True
+                    Y, _ = torch.linalg.qr(Y, mode='reduced')
+            if not end_with_qr:
+                Y, _ = torch.linalg.qr(Y, mode='reduced')
+            # small SVD + lift
+            Ub, S, Vh = torch.linalg.svd(Y.T @ self.X, full_matrices=False)
+            self.U = (Y @ Ub)[:, :self.r].contiguous()
+            self.S = S[:self.r].contiguous()
+            self.Vh = Vh[:self.r, :].contiguous()
+        else:
+            # randomized range finder
+            Y = self.X.T @ torch.randn(self.n, self.r, dtype=self.dtype, device=self.device)
+            Y, _ = torch.linalg.qr(Y, mode='reduced')
+            # sharpen spectrum with power iterations
+            for i in range(self.rand_trunk_svd_iters):
+                end_with_qr = False
+                Y = self.X.T @ (self.X @ Y)
+                if i % 4 == 0: # reorthogonalize during long power iteration
+                    end_with_qr = True
+                    Y, _ = torch.linalg.qr(Y, mode='reduced')
+            if not end_with_qr:
+                Y, _ = torch.linalg.qr(Y, mode='reduced')
+            # small SVD + lift
+            Ub, S, Vh = torch.linalg.svd(self.X @ Y, full_matrices=False)
+            self.U = Ub[:, :self.r].contiguous()
+            self.S = S[:self.r].contiguous()
+            self.Vh = (Y @ Vh.T).T[:self.r, :].contiguous()
+        
+        self._subspace_iteration(iters=3)
+
+    @torch.no_grad()
     def _rank1_update_core(self, u: torch.Tensor, v: torch.Tensor) -> None:
         '''
         Brand-like update of the top-r factors of the SVD after a rank-1 update.
+        Sec. 3 in https://www.merl.com/publications/docs/TR2006-059.pdf
+        (Fast low-rank modifications of the thin singular value decomposition, M. Brand)
         '''
         self.update_count += 1
         if self.recompute_every > 0 and self.update_count % self.recompute_every == 0:
@@ -224,14 +284,18 @@ class Rank1UpdatableTopkSVD:
                 self._subspace_iteration(u, v)
 
     @torch.no_grad()
-    def _subspace_iteration(self, u: torch.Tensor, v: torch.Tensor) -> None:
+    def _subspace_iteration(self, *args: tuple[Any, ...], iters: int = 0) -> None:
         '''
         Perform a subspace iteration to refine the top-r factors of the SVD.
+        Algorithm 4.4 in https://arxiv.org/pdf/0909.4061 + Rayleigh-Ritz lift
+        (Finding structure in randomness: Probabilistic algorithms for constructing
+        approximate matrix decompositions, N. Halko, P. G. Martinsson, J. A. Tropp)
         '''
+        
         X = self.X
         # orthonormalize V and iterate
         V, _ = torch.linalg.qr(self.Vh.T, mode='reduced')
-        for _ in range(self.subspace_iters):
+        for _ in range(max(iters, self.subspace_iters)):
             Y = X @ V
             U, _ = torch.linalg.qr(Y, mode='reduced')
             Y = X.T @ U
@@ -240,7 +304,7 @@ class Rank1UpdatableTopkSVD:
         U, _ = torch.linalg.qr(Y, mode='reduced')
 
         # Rayleigh-Ritz
-        B = U.T @ X @ V
+        B = U.T @ (X @ V)
         Ub, S, Vbh = torch.linalg.svd(B, full_matrices=False)
         self.U = U @ Ub
         self.S = S
@@ -251,6 +315,9 @@ class Rank1UpdatableTopkSVD:
         '''
         Perform a subspace iteration to refine the top-r factors of the SVD.
         Expands the subspace by the orthogonal components of the rank-1 update.
+        Algorithm 4.4 in https://arxiv.org/pdf/0909.4061 + Rayleigh-Ritz lift + basis extension
+        (Finding structure in randomness: Probabilistic algorithms for constructing
+        approximate matrix decompositions, N. Halko, P. G. Martinsson, J. A. Tropp)
         '''
         X = self.X
         # expand V by orthogonal components of rank-1 update
@@ -270,7 +337,7 @@ class Rank1UpdatableTopkSVD:
         U, _ = torch.linalg.qr(Y, mode='reduced')
 
         # Rayleigh-Ritz and truncate
-        B = U.T @ X @ V
+        B = U.T @ (X @ V)
         Ub, S, Vbh = torch.linalg.svd(B, full_matrices=False)
         self.U = (U @ Ub)[:, :self.r].contiguous()
         self.S = S[:self.r].contiguous()

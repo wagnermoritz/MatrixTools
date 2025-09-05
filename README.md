@@ -2,7 +2,9 @@
 In this repo, I collect implementations of algorithms for efficient, numerically stable, and memory-conscious processing of large-scale matrix operations. The file `test.ipynb` contains some small-scale example usage and error plots.
 
 ## Gram matrix streamer
-The `gram_matrix_streamer.py` file contains two implementations of Kahan's summation algorithm for building the Gram matrix of large data sets that don't fit in memory. One implementation computes a Knuth-style runnig mean so the magnitudes of the entries do not over or under flow.
+The `gram_matrix_streamer.py` file contains two implementations of Kahan's summation algorithm for building the Gram matrix of large data sets that don't fit in memory. One implementation computes a Knuth-style runnig mean so the magnitudes of the entries do not overflow.
+
+In this application "Gram matrix" referres to the _feature_ Gram matrix $X^\top X$ whose size depends on the number of dimensions, not the number of data points.
 
 **Key features of `StreamGramMatrix`:**
 - **Kahan summation**: Maintains a compensation term to reduce numerical errors
@@ -35,6 +37,9 @@ for batch in data_loader:
 gram_matrix = gram_computer.get_gram_matrix()
 ```
 
+- Kahan, W. (1965). Further remarks on reducing truncation errors, commun. Assoc. Comput. Mach, 8, 40.
+- Donald, E. K. (1999). The art of computer programming. Sorting and searching, 3(426-458), 4.
+
 ## Rank-1 updater for truncated SVD
 The `rank1_topk_SVD_updater.py` file contains an implementation of Brand`s rank-1 SVD update with optional refinement through subspace iteration.
 
@@ -45,6 +50,7 @@ The `rank1_topk_SVD_updater.py` file contains an implementation of Brand`s rank-
 - **Subspace expansion**: Optionally expand the subspace for subspace iteration by the orthogonal components introduced by the rank-1 update
 - **Multiple update types**: Supports various matrix modifications (rank-1 updates, row/column replacements/updates)
 - **Periodic recomputation**: Includes optional periodic recomputation of the full SVD for better stability
+- **Randomized truncated SVD**: Option to use randomized truncated SVD instead of `torch.linalg.svd` for very large matrices
 
 **Usage:**
 ```python
@@ -60,7 +66,8 @@ svd_updater = Rank1UpdatableTopkSVD(
     subspace_iters=2,           # 2 refinement iterations
     use_expanded_subspace=True, # expand the subspace for a better warm
                                 #     start to the subspace iteration
-    recompute_every=0           # ever recompute the SVD from scratch
+    recompute_every=0,          # never recompute the SVD from scratch
+    use_rand_trunk_svd=False    # matrix small enough for full SVD initialization
 )
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -91,3 +98,6 @@ U = svd_updater.U
 S = svd_updater.S
 Vh = svd_updater.Vh
 ```
+
+- Halko, N., Martinsson, P. G., & Tropp, J. A. (2011). Finding structure with randomness: Probabilistic algorithms for constructing approximate matrix decompositions. SIAM review, 53(2), 217-288.
+- Brand, M. (2006). Fast low-rank modifications of the thin singular value decomposition. Linear algebra and its applications, 415(1), 20-30.
